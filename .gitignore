@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Foundry build output
+out/
+cache/
+broadcast/
+
+# Node / frontend
+node_modules/
+.next/
+dist/
+coverage/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
