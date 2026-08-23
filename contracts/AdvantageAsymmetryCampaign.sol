@@ -16,8 +16,9 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 /// @dev Testnet demo artifact for a design-science research paper. Not audited.
 ///
 ///      ============================ BUILD STATUS ============================
-///      This contract implements the Day 1 (state machine) and Day 2 (supporter refund
-///      accounting) passes of the V1.1 refactor described in the project master brief.
+///      This contract implements the Day 1 (state machine), Day 2 (supporter refund
+///      accounting), and Day 3 (bounded recurring patronage) passes of the V1.1 refactor
+///      described in the project master brief.
 ///      Implemented:
 ///        - the Funding -> Active -> {Succeeded, Failed} state machine (Section 7.1)
 ///        - campaign creation validation (Section 7.2)
@@ -32,17 +33,9 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 ///        - existence validation for campaign/milestone IDs (Section 7.11)
 ///        - failure-time supporter refund accounting with an immutable historical
 ///          denominator and an order-independent pro-rata entitlement (Section 7.7)
-///
-///      It deliberately does NOT yet implement:
-///        - Patronage streaming (startPatronage/claimPatronage/cancelPatronage),
-///          scoped to Day 3 (Section 17). These functions, along with their struct
-///          and mapping, have been removed from this pass rather than carried over
-///          in their known-broken V0 form (baseline defects #7, #8), since a missing
-///          feature is safer than a live one that can strand funds. A `failureTimestamp`
-///          field has been added to the Campaign struct now, since Day 3's patronage
-///          accrual-freeze logic depends on knowing when a campaign failed, and it is
-///          more consistent to record that fact at the point of failure than retrofit
-///          it later.
+///        - bounded recurring patronage: fixed-deposit, rate-capped linear accrual,
+///          frozen at campaign failure, uninterrupted by campaign success, and settled
+///          atomically (no stranding) on supporter cancellation (Section 7.9)
 ///
 ///      An independent review of the Day 1 state machine surfaced two material issues,
 ///      fixed before Day 2 began:
@@ -98,6 +91,45 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 ///          timeout sweep or forfeiture mechanism -- adding one would let some other party
 ///          take value that belongs to a supporter, which is precisely the downside the
 ///          Advantage Asymmetry framing exists to cap.
+///
+///      ---- Day 3: bounded recurring patronage (Section 7.9) ----
+///      One lifetime patronage stream per (campaignId, supporter) pair, keyed directly in
+///      a mapping -- no stream IDs, no NFTs, no iterable registry, per the brief's explicit
+///      "keep the design simple" instruction. A stream can only ever be started once for a
+///      given pair; deposit is never zeroed after cancellation (same historical-record
+///      convention as bondAmount/refundDenominator elsewhere in this contract), so it also
+///      permanently marks that slot as used. This is a deliberate simplicity trade-off: a
+///      supporter who wants to patronise the same campaign again after cancelling cannot,
+///      in this prototype.
+///
+///      Accrual: accrued = min(elapsed * ratePerSecond, deposit), computed via
+///      _accruedPatronage(), which divides before multiplying (elapsed vs deposit/rate)
+///      specifically so the multiplication itself can never be asked to produce a value
+///      larger than deposit, closing the overflow path a naive elapsed*rate would open for
+///      adversarial rate/deposit/elapsed combinations. Per Section 7.9, ratePerSecond is
+///      also required at creation to be <= deposit, so full accrual can never take less
+///      than one second even at the maximum allowed rate.
+///
+///      Accrual cutoff, computed by _patronageAccrualCutoff(): campaign.failureTimestamp
+///      once Failed (frozen forever, however far block.timestamp later drifts), otherwise
+///      block.timestamp. This makes success and failure deliberately asymmetric: failure
+///      freezes every existing stream at the moment it happened; success does not freeze
+///      anything; existing streams keep accruing until fully accrued or cancelled. Reading
+///      the cutoff from the already-recorded failureTimestamp means a failure transaction
+///      never needs to iterate or touch any stream.
+///
+///      Cancellation is the permanent fix for the V0 defect where a cancelled stream's
+///      already-accrued-but-unclaimed creator entitlement became unreachable (claimed was
+///      settled to the unaccrued portion only, then claimablePatronage() returned zero for
+///      cancelled streams forever after). V1.1's cancelPatronage() computes both sides
+///      (creatorDue = accrued - claimed, supporterRefund = deposit - accrued) and settles
+///      both in the same transaction, so cumulative creator receipts + supporterRefund
+///      always equals deposit exactly, with nothing left behind.
+///
+///      Patronage is a third accounting bucket, fully independent of contribution/refund
+///      escrow and of the creator bond: startPatronage/claimPatronage/cancelPatronage never
+///      read or write totalContributed, contributorCount, totalReleased, refundDenominator,
+///      refundPool, totalRefunded, or bondOutcome, and the reverse holds too.
 ///      ========================================================================
 contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -185,11 +217,25 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         bool initialized;
     }
 
+    /// @notice One lifetime patronage stream per (campaignId, supporter). deposit is never
+    ///         zeroed after cancellation, matching the historical-record convention used
+    ///         for bondAmount/refundDenominator elsewhere, so `deposit > 0` doubles as the
+    ///         existence check and cancellation is permanent for a given pair (see header).
+    struct PatronageStream {
+        uint256 deposit;
+        uint256 ratePerSecond;
+        uint256 startTime;
+        uint256 claimed;
+        bool cancelled;
+        uint256 cancelledAt; // 0 while live; block.timestamp of cancellation otherwise
+    }
+
     uint256 public campaignCount;
     mapping(uint256 => Campaign) private campaigns;
     mapping(uint256 => mapping(address => uint256)) public contributions; // campaignId => contributor => amount
     mapping(uint256 => RefundAccounting) private refundAccounting; // campaignId => failure-time refund snapshot
     mapping(uint256 => mapping(address => bool)) public refundClaimed; // campaignId => contributor => claimed?
+    mapping(uint256 => mapping(address => PatronageStream)) private patronageStreams; // campaignId => supporter => stream
 
     // Simplification for prototype scope: the contract owner acts as milestone verifier.
     // A production version would replace this with a DAO vote, multisig, or oracle attestation.
@@ -221,6 +267,23 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     );
     event RefundClaimed(
         uint256 indexed campaignId, address indexed contributor, uint256 amount, bool isFinalClaimant, uint256 residue
+    );
+    event PatronageStarted(
+        uint256 indexed campaignId, address indexed supporter, uint256 deposit, uint256 ratePerSecond, uint256 startTime
+    );
+    event PatronageClaimed(
+        uint256 indexed campaignId,
+        address indexed supporter,
+        address indexed creator,
+        uint256 amount,
+        uint256 cumulativeClaimed
+    );
+    event PatronageCancelled(
+        uint256 indexed campaignId,
+        address indexed supporter,
+        address indexed creator,
+        uint256 creatorSettlement,
+        uint256 supporterRefund
     );
 
     modifier campaignExists(uint256 campaignId) {
@@ -609,6 +672,159 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         emit RefundClaimed(campaignId, msg.sender, amount, isFinalClaimant, residue);
     }
 
+    // ---------- Patronage (bounded recurring support) ----------
+
+    /// @dev Deterministic accrual cutoff for a campaign's patronage streams. Failed freezes
+    ///      every existing stream at the recorded failureTimestamp, however far
+    ///      block.timestamp later drifts; Active and Succeeded both use the live clock,
+    ///      which is what makes success deliberately NOT freeze existing patronage
+    ///      (Section 7.9's asymmetry with failure). No stream can exist while Funding, since
+    ///      startPatronage is Active-only, so that case is unreachable here.
+    function _patronageAccrualCutoff(Campaign storage c) internal view returns (uint256) {
+        if (c.status == CampaignStatus.Failed) {
+            return c.failureTimestamp;
+        }
+        return block.timestamp;
+    }
+
+    /// @dev accrued = min(elapsed * ratePerSecond, deposit), computed without ever letting
+    ///      the multiplication itself exceed deposit. Divides first (elapsed vs
+    ///      deposit/ratePerSecond) so that whenever elapsed is large enough that the true
+    ///      product would meet or exceed deposit, the function returns deposit directly and
+    ///      never performs the multiplication that could otherwise overflow for adversarial
+    ///      elapsed/rate combinations. When elapsed <= deposit/ratePerSecond (integer
+    ///      division, floors), elapsed*ratePerSecond <= (deposit/ratePerSecond)*ratePerSecond
+    ///      <= deposit, so the multiplication that does execute is always provably bounded
+    ///      by a value that already fits in uint256.
+    function _accruedPatronage(PatronageStream storage s, uint256 cutoff) internal view returns (uint256) {
+        if (cutoff <= s.startTime) return 0;
+        uint256 elapsed = cutoff - s.startTime;
+        if (elapsed > s.deposit / s.ratePerSecond) {
+            return s.deposit;
+        }
+        return elapsed * s.ratePerSecond;
+    }
+
+    /// @notice Amount the creator could claim for `supporter`'s stream right now. Returns 0
+    ///         for a nonexistent or cancelled stream.
+    function claimablePatronage(uint256 campaignId, address supporter)
+        public
+        view
+        campaignExists(campaignId)
+        returns (uint256)
+    {
+        PatronageStream storage s = patronageStreams[campaignId][supporter];
+        if (s.deposit == 0 || s.cancelled) return 0;
+        uint256 accrued = _accruedPatronage(s, _patronageAccrualCutoff(campaigns[campaignId]));
+        return accrued - s.claimed; // accrued is monotonic non-decreasing, so this never underflows
+    }
+
+    /// @notice Supporter opens a bounded recurring patronage stream against `campaignId`.
+    ///         The supporter need not have contributed during the funding phase -- patronage
+    ///         is a separate, independent form of support (Section 7.9).
+    /// @dev One lifetime stream per (campaignId, supporter); see the struct/header notes on
+    ///      why cancellation is permanent for a given pair in this prototype.
+    function startPatronage(uint256 campaignId, uint256 deposit, uint256 ratePerSecond)
+        external
+        nonReentrant
+        whenNotPaused
+        campaignExists(campaignId)
+    {
+        Campaign storage c = campaigns[campaignId];
+        require(msg.sender != owner(), "verifier cannot patronise");
+        require(msg.sender != penaltySink, "penalty sink cannot patronise");
+        require(msg.sender != c.creator, "creator cannot patronise own campaign");
+        require(c.status == CampaignStatus.Active, "campaign not active");
+        require(deposit > 0, "deposit must be > 0");
+        require(ratePerSecond > 0, "rate must be > 0");
+        require(ratePerSecond <= deposit, "rate exceeds deposit");
+
+        PatronageStream storage s = patronageStreams[campaignId][msg.sender];
+        require(s.deposit == 0, "existing patronage stream");
+
+        // Deliberately touches no Campaign field except the read of status/creator above:
+        // patronage is a third accounting bucket, fully independent of contribution/refund
+        // escrow and the creator bond (Section 11 / header notes).
+        token.safeTransferFrom(msg.sender, address(this), deposit);
+
+        s.deposit = deposit;
+        s.ratePerSecond = ratePerSecond;
+        s.startTime = block.timestamp;
+
+        emit PatronageStarted(campaignId, msg.sender, deposit, ratePerSecond, block.timestamp);
+    }
+
+    /// @notice Creator pulls whatever has accrued-but-not-yet-been-claimed for a given
+    ///         supporter's stream. Callable after Failed (settles legitimate pre-failure
+    ///         accrual) and after Succeeded (accrual continues uninterrupted).
+    /// @dev Blocked while paused: this is the discretionary creator release Section 7.10
+    ///      treats as new risk-adjacent activity, unlike the supporter's own cancellation.
+    function claimPatronage(uint256 campaignId, address supporter)
+        external
+        nonReentrant
+        whenNotPaused
+        campaignExists(campaignId)
+    {
+        Campaign storage c = campaigns[campaignId];
+        require(msg.sender == c.creator, "only creator claims");
+
+        PatronageStream storage s = patronageStreams[campaignId][supporter];
+        require(s.deposit > 0, "no patronage stream");
+        require(!s.cancelled, "stream cancelled");
+
+        uint256 accrued = _accruedPatronage(s, _patronageAccrualCutoff(c));
+        uint256 claimable = accrued - s.claimed;
+        require(claimable > 0, "nothing to claim");
+
+        s.claimed += claimable; // effects before interaction
+        assert(s.claimed <= s.deposit); // accrued is itself capped at deposit; belt-and-braces
+
+        token.safeTransfer(c.creator, claimable);
+
+        emit PatronageClaimed(campaignId, supporter, c.creator, claimable, s.claimed);
+    }
+
+    /// @notice Supporter-initiated atomic settlement and exit. Permanent fix for the V0
+    ///         defect where a cancelled stream's already-accrued-but-unclaimed creator
+    ///         entitlement became permanently unreachable: this function settles BOTH sides
+    ///         in one transaction, so creatorDue + supporterRefund + previously-claimed
+    ///         always equals deposit exactly, with nothing left behind.
+    ///
+    ///             creatorDue       = accrued - claimed
+    ///             supporterRefund  = deposit - accrued
+    ///
+    /// @dev Deliberately NOT gated by whenNotPaused: this is a risk-reducing user exit, and
+    ///      per Section 7.10 / the established refund-exit precedent it must remain callable
+    ///      while paused even though ordinary creator claims are blocked. Works identically
+    ///      across Active, Succeeded, and Failed, since the cutoff/accrual calculation
+    ///      already accounts for all three. Effects (marking cancelled, settling `claimed`)
+    ///      happen before either transfer.
+    function cancelPatronage(uint256 campaignId) external nonReentrant campaignExists(campaignId) {
+        Campaign storage c = campaigns[campaignId];
+        PatronageStream storage s = patronageStreams[campaignId][msg.sender];
+        require(s.deposit > 0, "no patronage stream");
+        require(!s.cancelled, "stream already cancelled");
+
+        uint256 accrued = _accruedPatronage(s, _patronageAccrualCutoff(c));
+        uint256 creatorDue = accrued - s.claimed;
+        uint256 supporterRefund = s.deposit - accrued;
+
+        // ---- effects ----
+        s.cancelled = true;
+        s.cancelledAt = block.timestamp;
+        s.claimed += creatorDue; // fully settles claimed to accrued; claimPatronage can never fire again
+
+        // ---- interactions ----
+        if (creatorDue > 0) {
+            token.safeTransfer(c.creator, creatorDue);
+        }
+        if (supporterRefund > 0) {
+            token.safeTransfer(msg.sender, supporterRefund);
+        }
+
+        emit PatronageCancelled(campaignId, msg.sender, c.creator, creatorDue, supporterRefund);
+    }
+
     // ---------- Bond disposition (internal) ----------
 
     /// @dev Enforces the "bond resolves to exactly one terminal outcome" invariant on-chain.
@@ -753,6 +969,70 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         return Math.mulDiv(contributed, r.refundPool, r.refundDenominator);
     }
 
+    /// @notice Full patronage-stream snapshot for the dashboard. Kept separate from
+    ///         getCampaign() rather than widening an already-large tuple.
+    ///
+    ///         For a wallet that has never opened a stream on this campaign, every field
+    ///         reads as its zero value (deposit 0, cancelled false, etc.) -- this is a
+    ///         genuine "no stream" signal, distinguishable from a live zero-accrual stream
+    ///         only via `deposit == 0` (see hasPatronageStream()). This function never
+    ///         reverts for a nonexistent stream, which matters because a naive accrual
+    ///         calculation would otherwise divide by ratePerSecond == 0 and panic.
+    ///
+    ///         For a cancelled stream, `accrued` and `claimed` both freeze at the value
+    ///         settled during cancelPatronage(), and creatorClaimable/supporterRecoverable
+    ///         both read 0 -- there is nothing left to claim or recover on either side.
+    ///         For a live stream, `accrued` is computed against the correct cutoff (frozen
+    ///         at failureTimestamp if Failed, live otherwise), creatorClaimable is what the
+    ///         creator could pull right now, and supporterRecoverable is what the supporter
+    ///         would receive if they cancelled at this exact moment.
+    function getPatronageStream(uint256 campaignId, address supporter)
+        external
+        view
+        campaignExists(campaignId)
+        returns (
+            uint256 deposit,
+            uint256 ratePerSecond,
+            uint256 startTime,
+            uint256 claimed,
+            bool cancelled,
+            uint256 cancelledAt,
+            uint256 accrued,
+            uint256 creatorClaimable,
+            uint256 supporterRecoverable
+        )
+    {
+        PatronageStream storage s = patronageStreams[campaignId][supporter];
+
+        if (s.deposit == 0) {
+            // No stream has ever been opened for this pair. Return a zero snapshot rather
+            // than falling through to _accruedPatronage(), which would divide by
+            // s.ratePerSecond == 0 and panic -- the dashboard must be able to inspect an
+            // arbitrary wallet's patronage status without reverting.
+            return (0, 0, 0, 0, false, 0, 0, 0, 0);
+        }
+
+        if (s.cancelled) {
+            // Frozen at the values cancelPatronage() already settled; nothing further to
+            // claim or recover from either side.
+            return (s.deposit, s.ratePerSecond, s.startTime, s.claimed, true, s.cancelledAt, s.claimed, 0, 0);
+        }
+
+        uint256 acc = _accruedPatronage(s, _patronageAccrualCutoff(campaigns[campaignId]));
+        return (s.deposit, s.ratePerSecond, s.startTime, s.claimed, false, 0, acc, acc - s.claimed, s.deposit - acc);
+    }
+
+    /// @notice Whether `supporter` has ever opened a patronage stream on `campaignId`
+    ///         (live or cancelled). Convenience wrapper over getPatronageStream()'s deposit.
+    function hasPatronageStream(uint256 campaignId, address supporter)
+        external
+        view
+        campaignExists(campaignId)
+        returns (bool)
+    {
+        return patronageStreams[campaignId][supporter].deposit > 0;
+    }
+
     // ---------- Emergency controls ----------
     //
     // Pause policy (Section 7.10, stakeholder clarification 6), applied incrementally
@@ -763,6 +1043,8 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     //     - contribute          (new contribution)
     //     - approveMilestone    (discretionary release)
     //     - rejectMilestone     (discretionary verifier decision)
+    //     - startPatronage      (new risk; Day 3)
+    //     - claimPatronage      (discretionary creator release; Day 3)
     //
     //   Never blocked by pause (objective triggers and risk-reducing exits must always
     //   remain callable, per Section 7.10's "user exit should remain available wherever
@@ -772,10 +1054,9 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     //     - triggerFundingExpiry    (permissionless, objective, resolves locked funds)
     //     - triggerExecutionExpiry  (permissionless, objective, resolves locked funds)
     //     - claimRefund             (risk-reducing supporter exit; Day 2)
-    //
-    //   Not yet implemented in this pass, but committed to the same policy when it lands:
-    //   cancelPatronage must never be pause-gated; only startPatronage (new risk) and the
-    //   creator's claimPatronage (discretionary release of accrued value) should be.
+    //     - cancelPatronage         (risk-reducing supporter exit; Day 3, same precedent
+    //                                as claimRefund -- settles creator's earned share too,
+    //                                but the transaction is supporter-initiated)
 
     function pause() external onlyOwner {
         _pause();
