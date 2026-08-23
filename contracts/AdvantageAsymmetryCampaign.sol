@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title AdvantageAsymmetryCampaign
 /// @notice Research prototype instantiating the advantage-asymmetry design principle:
@@ -15,8 +16,9 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 /// @dev Testnet demo artifact for a design-science research paper. Not audited.
 ///
 ///      ============================ BUILD STATUS ============================
-///      This is the Day 1 (state-machine) pass of the V1.1 refactor described in
-///      the project master brief. It implements:
+///      This contract implements the Day 1 (state machine) and Day 2 (supporter refund
+///      accounting) passes of the V1.1 refactor described in the project master brief.
+///      Implemented:
 ///        - the Funding -> Active -> {Succeeded, Failed} state machine (Section 7.1)
 ///        - campaign creation validation (Section 7.2)
 ///        - the funding-phase contribution cap and auto-activation (Section 7.3)
@@ -28,14 +30,10 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 ///          success, returned on underfunded failure, returned on verifier-review
 ///          timeout, and slashed to a neutral sink on creator-caused failure
 ///        - existence validation for campaign/milestone IDs (Section 7.11)
+///        - failure-time supporter refund accounting with an immutable historical
+///          denominator and an order-independent pro-rata entitlement (Section 7.7)
 ///
 ///      It deliberately does NOT yet implement:
-///        - claimRefund() / the supporter-facing pro-rata refund pool (Section 7.7).
-///          This is the complex, order-sensitive multi-supporter accounting fix
-///          (baseline defect #1) and remains scoped to Day 2 per the master brief's
-///          execution plan (Section 17, Day 2: "Refund + bond correctness"). The
-///          `contributions` mapping below is still populated so Day 2 has the data
-///          it needs.
 ///        - Patronage streaming (startPatronage/claimPatronage/cancelPatronage),
 ///          scoped to Day 3 (Section 17). These functions, along with their struct
 ///          and mapping, have been removed from this pass rather than carried over
@@ -46,8 +44,8 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 ///          more consistent to record that fact at the point of failure than retrofit
 ///          it later.
 ///
-///      An independent review of this Day 1 pass surfaced two material issues, fixed
-///      before Day 2 began:
+///      An independent review of the Day 1 state machine surfaced two material issues,
+///      fixed before Day 2 began:
 ///        - executionDeadline is now a hard boundary. submitMilestone, approveMilestone,
 ///          and rejectMilestone all revert at/after executionDeadline; triggerExecutionExpiry
 ///          is the sole resolution path from that instant on. This closes both a creator
@@ -63,6 +61,43 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 ///      Also hardened in the same pass: the verifier and the penalty sink are now barred
 ///      from contributing (contribute()); createCampaign is nonReentrant; submitMilestone
 ///      requires a non-empty evidence URI.
+///
+///      ---- Day 2: supporter refund accounting (Section 7.7) ----
+///      Refund state is snapshotted exactly once, at the moment of failure, by
+///      _failCampaign(). The historical denominator (refundDenominator) and every
+///      contributions[campaignId][supporter] record are immutable from that point on;
+///      claimRefund() never writes to either. This is the permanent fix for baseline
+///      defect #1, in which V0 decremented totalContributed on each claim and computed
+///      later refunds against a shrinking denominator, making payouts order-dependent
+///      and capable of underflowing or stranding funds.
+///
+///      Creator bonds are strictly segregated from supporter refunds: refundPool is
+///      derived solely from supporter contributions (totalContributed - totalReleased),
+///      a slashed bond goes only to penaltySink, and a returned bond goes only to the
+///      creator. Neither ever enters refundPool, consistent with the paper's framing of
+///      supporters as patrons rather than investors entitled to upside (Section 7.6).
+///
+///      Role separation: the verifier/owner, the penalty sink, and the campaign creator
+///      are all barred from contributing to a campaign. Excluding the creator is a
+///      deliberate prototype-design decision, not an accounting constraint: it prevents
+///      creator self-funding from being represented in totalContributed/contributorCount
+///      as external campaign support, which would misrepresent the social proof that the
+///      paper's trust pathway depends on.
+///
+///      ON "NO STRANDED FUNDS" -- two distinct things worth separating precisely:
+///        - Accounting-generated residue: NONE. Integer flooring makes the sum of base
+///          entitlements fall short of refundPool by at most (contributorCount - 1) base
+///          units; the final claimant is paid the remainder rather than their floored
+///          base, so once every eligible contributor has claimed,
+///          totalRefunded == refundPool exactly and no residue is left behind by the
+///          arithmetic.
+///        - Unclaimed user entitlement: possible, and by design. claimRefund is a
+///          pull-payment; if an eligible supporter never submits a claim, their
+///          entitlement stays escrowed in the contract indefinitely. That is unexercised
+///          user action, not a contract accounting defect, and there is deliberately no
+///          timeout sweep or forfeiture mechanism -- adding one would let some other party
+///          take value that belongs to a supporter, which is precisely the downside the
+///          Advantage Asymmetry framing exists to cap.
 ///      ========================================================================
 contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
@@ -125,6 +160,7 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         uint256 bondAmount; // creator's posted bond; historical record, not zeroed on disposition
         uint256 totalContributed;
         uint256 totalReleased;
+        uint256 contributorCount; // unique contributing wallets; one wallet counts once regardless of repeats
         uint256 nextMilestoneIndex; // index of the next milestone that must be submitted/released
         uint256 fundingDeadline;
         uint256 executionDeadline;
@@ -135,9 +171,25 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         Milestone[] milestones;
     }
 
+    /// @notice Failure-time refund snapshot. Written exactly once, by _failCampaign(), and
+    ///         thereafter only `totalRefunded` and `refundClaimCount` ever change. Keeping
+    ///         this in its own struct (rather than widening Campaign/getCampaign) keeps the
+    ///         immutable-after-failure fields visually and structurally separate from the
+    ///         live campaign fields they are derived from.
+    struct RefundAccounting {
+        uint256 refundDenominator; // == totalContributed at failure. IMMUTABLE after failure.
+        uint256 refundPool; // == totalContributed - totalReleased at failure. IMMUTABLE after failure.
+        uint256 totalRefunded; // running sum of amounts actually paid out
+        uint256 contributorCount; // snapshot of unique contributors eligible to claim
+        uint256 refundClaimCount; // how many distinct contributors have claimed so far
+        bool initialized;
+    }
+
     uint256 public campaignCount;
     mapping(uint256 => Campaign) private campaigns;
     mapping(uint256 => mapping(address => uint256)) public contributions; // campaignId => contributor => amount
+    mapping(uint256 => RefundAccounting) private refundAccounting; // campaignId => failure-time refund snapshot
+    mapping(uint256 => mapping(address => bool)) public refundClaimed; // campaignId => contributor => claimed?
 
     // Simplification for prototype scope: the contract owner acts as milestone verifier.
     // A production version would replace this with a DAO vote, multisig, or oracle attestation.
@@ -160,6 +212,16 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     event CampaignFailed(uint256 indexed campaignId, FailureReason reason);
     event BondReturned(uint256 indexed campaignId, address indexed creator, uint256 amount);
     event BondSlashed(uint256 indexed campaignId, address indexed sink, uint256 amount);
+    event RefundPoolInitialized(
+        uint256 indexed campaignId,
+        FailureReason indexed reason,
+        uint256 refundDenominator,
+        uint256 refundPool,
+        uint256 contributorCount
+    );
+    event RefundClaimed(
+        uint256 indexed campaignId, address indexed contributor, uint256 amount, bool isFinalClaimant, uint256 residue
+    );
 
     modifier campaignExists(uint256 campaignId) {
         require(campaignId < campaignCount, "campaign does not exist");
@@ -265,12 +327,23 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         Campaign storage c = campaigns[campaignId];
         require(msg.sender != owner(), "verifier cannot contribute");
         require(msg.sender != penaltySink, "penalty sink cannot contribute");
+        // Prototype-design decision, not an accounting constraint: creator self-funding must
+        // not be counted as external support. Placed before any state write so a rejected
+        // attempt cannot touch contributorCount, totalContributed, or the contributions record.
+        require(msg.sender != c.creator, "creator cannot contribute");
         require(c.status == CampaignStatus.Funding, "campaign not in funding");
         require(block.timestamp < c.fundingDeadline, "funding deadline has passed");
         require(amount > 0, "amount must be > 0");
         require(amount <= c.goal - c.totalContributed, "amount exceeds remaining goal");
 
         token.safeTransferFrom(msg.sender, address(this), amount);
+        // Count a wallet once, on its first positive contribution only. Repeat contributions
+        // from the same wallet must not inflate contributorCount, or the final-claimant
+        // check in claimRefund() would never fire and the bounded rounding residue would be
+        // left unclaimable by the arithmetic itself.
+        if (contributions[campaignId][msg.sender] == 0) {
+            c.contributorCount += 1;
+        }
         contributions[campaignId][msg.sender] += amount;
         c.totalContributed += amount;
 
@@ -293,10 +366,7 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         require(c.status == CampaignStatus.Funding, "campaign not in funding");
         require(block.timestamp >= c.fundingDeadline, "funding deadline not yet reached");
 
-        c.status = CampaignStatus.Failed;
-        c.failureReason = FailureReason.Underfunded;
-        c.failureTimestamp = block.timestamp;
-
+        _failCampaign(campaignId, c, FailureReason.Underfunded);
         _returnBond(campaignId, c);
 
         emit CampaignFailed(campaignId, FailureReason.Underfunded);
@@ -384,9 +454,7 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         require(m.status == MilestoneStatus.Submitted, "milestone not submitted");
 
         m.status = MilestoneStatus.Rejected;
-        c.status = CampaignStatus.Failed;
-        c.failureReason = FailureReason.MilestoneRejected;
-        c.failureTimestamp = block.timestamp;
+        _failCampaign(campaignId, c, FailureReason.MilestoneRejected);
 
         _slashBond(campaignId, c);
 
@@ -416,20 +484,129 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         require(c.status == CampaignStatus.Active, "campaign not active");
         require(block.timestamp >= c.executionDeadline, "execution deadline not yet reached");
 
-        c.status = CampaignStatus.Failed;
-        c.failureTimestamp = block.timestamp;
-
         Milestone storage m = c.milestones[c.nextMilestoneIndex];
 
         if (m.status == MilestoneStatus.Submitted) {
-            c.failureReason = FailureReason.VerifierReviewExpired;
+            _failCampaign(campaignId, c, FailureReason.VerifierReviewExpired);
             _returnBond(campaignId, c);
         } else {
-            c.failureReason = FailureReason.CreatorExecutionExpired;
+            _failCampaign(campaignId, c, FailureReason.CreatorExecutionExpired);
             _slashBond(campaignId, c);
         }
 
         emit CampaignFailed(campaignId, c.failureReason);
+    }
+
+    // ---------- Failure + refund accounting ----------
+
+    /// @dev The single entry point for every Failed transition (underfunded funding expiry,
+    ///      milestone rejection, creator execution expiry, verifier review expiry). Sets the
+    ///      terminal status/reason/timestamp and snapshots refund accounting exactly once.
+    ///
+    ///      The snapshot is what makes refunds order-independent. refundDenominator freezes
+    ///      the historical contribution total and refundPool freezes the unreleased
+    ///      remainder; neither is ever recomputed, and claimRefund() never touches
+    ///      totalContributed or the per-supporter contributions record. V0's bug was exactly
+    ///      the absence of this freeze.
+    ///
+    ///      Note refundPool deliberately excludes the creator bond in both directions: a
+    ///      slashed bond leaves for penaltySink and a returned bond leaves for the creator,
+    ///      and neither is ever added to the supporter pool.
+    function _failCampaign(uint256 campaignId, Campaign storage c, FailureReason reason) internal {
+        require(!refundAccounting[campaignId].initialized, "refund accounting already initialized");
+
+        c.status = CampaignStatus.Failed;
+        c.failureReason = reason;
+        c.failureTimestamp = block.timestamp;
+
+        // totalReleased <= totalContributed holds by construction: releases only occur in
+        // Active, which is only reachable once totalContributed == goal, and the milestone
+        // amounts sum to exactly goal. Subtraction cannot underflow.
+        uint256 pool = c.totalContributed - c.totalReleased;
+
+        RefundAccounting storage r = refundAccounting[campaignId];
+        r.refundDenominator = c.totalContributed;
+        r.refundPool = pool;
+        r.contributorCount = c.contributorCount;
+        r.initialized = true;
+        // totalRefunded and refundClaimCount intentionally left at 0.
+
+        emit RefundPoolInitialized(campaignId, reason, c.totalContributed, pool, c.contributorCount);
+    }
+
+    /// @notice Supporters pull their share of the unreleased contribution escrow after a
+    ///         campaign has failed. Pull-payment, not push, so one failing transfer cannot
+    ///         block everyone else.
+    ///
+    ///         Entitlement is the floored proportional share of the frozen pool:
+    ///
+    ///             baseEntitlement = contribution * refundPool / refundDenominator
+    ///
+    ///         computed with OpenZeppelin Math.mulDiv for full-precision intermediate
+    ///         multiplication (no overflow on the contribution*refundPool product).
+    ///
+    ///         Because integer division floors, the sum of all base entitlements can fall
+    ///         short of refundPool by a bounded residue of at most (contributorCount - 1)
+    ///         base units. The final eligible claimant is therefore paid
+    ///         `refundPool - totalRefunded` instead of their floored base, which exhausts
+    ///         that residue. Once every eligible contributor has claimed,
+    ///         totalRefunded == refundPool exactly and the arithmetic leaves nothing behind.
+    ///
+    ///         Separately: if an eligible supporter never submits a claim, their entitlement
+    ///         remains escrowed in this contract indefinitely. That is an unexercised pull
+    ///         payment, not an accounting defect, and there is deliberately no timeout sweep
+    ///         or forfeiture path that would reassign it to anyone else.
+    ///
+    ///         CLAIM-ORDER SEMANTICS: claim order affects ONLY which contributor receives
+    ///         that bounded residue. It never changes any contributor's underlying
+    ///         proportional entitlement, because every base entitlement is computed against
+    ///         the same frozen denominator and pool. This is the deliberate, documented
+    ///         difference from V0, where claim order changed the actual entitlement.
+    ///
+    /// @dev Deliberately NOT gated by whenNotPaused: a refund is a risk-reducing user exit
+    ///      and must remain available while paused (Section 7.10, clarification 6).
+    ///      Follows checks-effects-interactions; nonReentrant is belt-and-braces on top.
+    function claimRefund(uint256 campaignId) external nonReentrant campaignExists(campaignId) {
+        Campaign storage c = campaigns[campaignId];
+        require(c.status == CampaignStatus.Failed, "campaign not failed");
+
+        uint256 contributed = contributions[campaignId][msg.sender];
+        require(contributed > 0, "no contribution to refund");
+        require(!refundClaimed[campaignId][msg.sender], "refund already claimed");
+
+        RefundAccounting storage r = refundAccounting[campaignId];
+
+        // ---- effects ----
+        refundClaimed[campaignId][msg.sender] = true;
+
+        bool isFinalClaimant = (r.refundClaimCount + 1 == r.contributorCount);
+        uint256 amount;
+        uint256 residue;
+
+        if (isFinalClaimant) {
+            // Exhaust the pool exactly. Cannot underflow: every prior payout was a floored
+            // share of the same pool, so totalRefunded <= refundPool at all times.
+            amount = r.refundPool - r.totalRefunded;
+            uint256 base = Math.mulDiv(contributed, r.refundPool, r.refundDenominator);
+            residue = amount - base; // bounded rounding dust handed to the last claimant
+        } else {
+            // refundDenominator > 0 whenever a positive contribution exists, so no
+            // division-by-zero is reachable here.
+            amount = Math.mulDiv(contributed, r.refundPool, r.refundDenominator);
+        }
+
+        r.refundClaimCount += 1;
+        r.totalRefunded += amount;
+
+        // ---- interactions ----
+        // A zero-value claim is still a valid claim: it marks the supporter as settled and
+        // advances refundClaimCount, which is required for the final-claimant check to be
+        // reachable. Skipping the transfer avoids a pointless token call, not the bookkeeping.
+        if (amount > 0) {
+            token.safeTransfer(msg.sender, amount);
+        }
+
+        emit RefundClaimed(campaignId, msg.sender, amount, isFinalClaimant, residue);
     }
 
     // ---------- Bond disposition (internal) ----------
@@ -504,6 +681,78 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
         return campaigns[campaignId].milestones[milestoneIndex];
     }
 
+    /// @notice Failure-time refund snapshot for the dashboard. Kept separate from
+    ///         getCampaign() rather than widening an already-large tuple.
+    function getRefundAccounting(uint256 campaignId)
+        external
+        view
+        campaignExists(campaignId)
+        returns (
+            uint256 refundDenominator,
+            uint256 refundPool,
+            uint256 totalRefunded,
+            uint256 refundRemaining,
+            uint256 contributorCount,
+            uint256 refundClaimCount,
+            bool initialized
+        )
+    {
+        RefundAccounting storage r = refundAccounting[campaignId];
+        return (
+            r.refundDenominator,
+            r.refundPool,
+            r.totalRefunded,
+            r.refundPool - r.totalRefunded,
+            r.contributorCount,
+            r.refundClaimCount,
+            r.initialized
+        );
+    }
+
+    /// @notice Unique contributing wallets. Live during Funding, final from failure onward.
+    function getContributorCount(uint256 campaignId) external view campaignExists(campaignId) returns (uint256) {
+        return campaigns[campaignId].contributorCount;
+    }
+
+    /// @notice What `contributor` would receive from claimRefund() right now, including the
+    ///         rounding residue if they would be the final claimant.
+    ///
+    ///         FRONTEND SEMANTICS -- READ BEFORE GATING A BUTTON ON THIS:
+    ///         A return value of 0 does NOT mean the wallet is ineligible to claim. Zero is
+    ///         returned in four distinct situations, only three of which are ineligibility:
+    ///           1. the campaign has not failed                          -> ineligible
+    ///           2. the wallet never contributed                         -> ineligible
+    ///           3. the wallet has already claimed                       -> ineligible
+    ///           4. the wallet HAS an unclaimed positive contribution whose floored
+    ///              entitlement happens to be zero (a dust contribution against a small
+    ///              pool)                                               -> ELIGIBLE
+    ///         Case 4 is a legitimate, claimable state and the claim must be allowed to
+    ///         proceed: it records the supporter as settled and advances refundClaimCount,
+    ///         which the final-claimant branch depends on. A UI that hides or disables the
+    ///         claim action purely because previewRefund() == 0 can therefore leave the
+    ///         final claimant's residue unreachable. Distinguish the cases using
+    ///         contributions(campaignId, wallet) and refundClaimed(campaignId, wallet)
+    ///         rather than inferring eligibility from this value alone.
+    function previewRefund(uint256 campaignId, address contributor)
+        external
+        view
+        campaignExists(campaignId)
+        returns (uint256)
+    {
+        Campaign storage c = campaigns[campaignId];
+        if (c.status != CampaignStatus.Failed) return 0;
+        if (refundClaimed[campaignId][contributor]) return 0;
+
+        uint256 contributed = contributions[campaignId][contributor];
+        if (contributed == 0) return 0;
+
+        RefundAccounting storage r = refundAccounting[campaignId];
+        if (r.refundClaimCount + 1 == r.contributorCount) {
+            return r.refundPool - r.totalRefunded;
+        }
+        return Math.mulDiv(contributed, r.refundPool, r.refundDenominator);
+    }
+
     // ---------- Emergency controls ----------
     //
     // Pause policy (Section 7.10, stakeholder clarification 6), applied incrementally
@@ -522,11 +771,11 @@ contract AdvantageAsymmetryCampaign is Ownable, ReentrancyGuard, Pausable {
     //     - submitMilestone         (moves no funds; not risk-taking)
     //     - triggerFundingExpiry    (permissionless, objective, resolves locked funds)
     //     - triggerExecutionExpiry  (permissionless, objective, resolves locked funds)
+    //     - claimRefund             (risk-reducing supporter exit; Day 2)
     //
-    //   Not yet implemented in this Day 1 pass, but committed to the same policy when
-    //   they land: claimRefund and cancelPatronage must never be pause-gated; only
-    //   startPatronage (new risk) and the creator's claimPatronage (discretionary release
-    //   of accrued value) should be.
+    //   Not yet implemented in this pass, but committed to the same policy when it lands:
+    //   cancelPatronage must never be pause-gated; only startPatronage (new risk) and the
+    //   creator's claimPatronage (discretionary release of accrued value) should be.
 
     function pause() external onlyOwner {
         _pause();
