@@ -13,3 +13,9 @@ via_ir = true
 
 [fmt]
 line_length = 120
+
+[invariant]
+runs = 24
+depth = 400
+fail_on_revert = true
+call_override = false
