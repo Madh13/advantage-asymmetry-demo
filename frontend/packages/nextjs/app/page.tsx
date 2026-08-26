@@ -3,6 +3,7 @@
 import { Address } from "@scaffold-ui/components";
 import type { NextPage } from "next";
 import { useAccount } from "wagmi";
+import { CampaignWorkspace } from "~~/components/advantage-asymmetry/CampaignWorkspace";
 import { CreateCampaign } from "~~/components/advantage-asymmetry/CreateCampaign";
 import { useScaffoldReadContract, useTargetNetwork } from "~~/hooks/scaffold-eth";
 
@@ -201,6 +202,10 @@ const Home: NextPage = () => {
                 </div>
               </div>
             </div>
+          </div>
+
+          <div className="mt-10">
+            <CampaignWorkspace verifierAddress={owner} penaltySinkAddress={penaltySink} />
           </div>
 
           <div className="mt-10">
