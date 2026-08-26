@@ -5,12 +5,12 @@ import { GenericContractsDeclaration } from "~~/utils/scaffold-eth/contract";
 const externalContracts = {
   11155111: {
     AdvantageAsymmetryCampaign: {
-      address: "0xcD51F769860FE95fCab126AdC5fc2b9D24afB24b",
+      address: "0xB56503b117cE85530dD4990a5EFbE018A682A8C8",
       abi: advantageAsymmetryAbi,
-      deployedOnBlock: 11555532,
+      deployedOnBlock: 11570623,
     },
-    AUDD: {
-      address: "0x3619D7F95b0eaCae63DfA1909Ab797eb0aFc01E1",
+    USDC: {
+      address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
       abi: erc20Abi,
     },
   },

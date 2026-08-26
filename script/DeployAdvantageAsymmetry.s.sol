@@ -5,8 +5,8 @@ import "forge-std/Script.sol";
 import "../contracts/AdvantageAsymmetryCampaign.sol";
 
 contract DeployAdvantageAsymmetry is Script {
-    address internal constant AUDD_SEPOLIA =
-        0x3619D7F95b0eaCae63DfA1909Ab797eb0aFc01E1;
+    address internal constant USDC_SEPOLIA =
+        0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238;
 
     address internal constant PENALTY_SINK =
         0x000000000000000000000000000000000000dEaD;
@@ -15,7 +15,7 @@ contract DeployAdvantageAsymmetry is Script {
         vm.startBroadcast();
 
         deployed = new AdvantageAsymmetryCampaign(
-            AUDD_SEPOLIA,
+            USDC_SEPOLIA,
             PENALTY_SINK
         );
 

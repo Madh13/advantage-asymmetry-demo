@@ -22,7 +22,8 @@
     "vercel:yolo": "yarn workspace @se-2/nextjs vercel:yolo"
   },
   "resolutions": {
-    "@coinbase/cdp-sdk": "1.52.0"
+    "@coinbase/cdp-sdk": "1.52.0",
+    "qr": "0.5.5"
   },
   "packageManager": "yarn@4.13.0",
   "engines": {
