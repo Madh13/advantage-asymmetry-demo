@@ -1,13 +1,16 @@
 "use client";
 
+import { useState } from "react";
 import { Address } from "@scaffold-ui/components";
 import { formatUnits } from "viem";
 import type { Address as AddressType } from "viem";
 import { useAccount } from "wagmi";
-import { useScaffoldReadContract, useTargetNetwork } from "~~/hooks/scaffold-eth";
+import externalContracts from "~~/contracts/externalContracts";
+import { useScaffoldReadContract, useScaffoldWriteContract, useTargetNetwork } from "~~/hooks/scaffold-eth";
 
 const CAMPAIGN_ID = 0n;
 const USDC_DECIMALS = 6;
+const CAMPAIGN_ADDRESS = externalContracts[11155111].AdvantageAsymmetryCampaign.address;
 
 const CAMPAIGN_STATUS_LABELS = ["Funding", "Active", "Succeeded", "Failed"] as const;
 const CAMPAIGN_STATUS_BADGE: Record<number, string> = {
@@ -94,6 +97,30 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
     args: [campaignExists ? CAMPAIGN_ID : undefined, connectedAddress],
   });
 
+  // ---------- Fund this campaign: reads ----------
+
+  const { data: usdcBalance } = useScaffoldReadContract({
+    contractName: "USDC",
+    functionName: "balanceOf",
+    args: [connectedAddress],
+  });
+
+  const { data: usdcAllowance, refetch: refetchUsdcAllowance } = useScaffoldReadContract({
+    contractName: "USDC",
+    functionName: "allowance",
+    args: [connectedAddress, CAMPAIGN_ADDRESS],
+  });
+
+  const { writeContractAsync: writeUsdc, isMining: isApproving } = useScaffoldWriteContract({
+    contractName: "USDC",
+  });
+
+  const { writeContractAsync: writeCampaign, isMining: isContributing } = useScaffoldWriteContract({
+    contractName: "AdvantageAsymmetryCampaign",
+  });
+
+  const [fundingStatusMessage, setFundingStatusMessage] = useState("");
+
   const remainingToFund =
     goal !== undefined && totalContributed !== undefined
       ? goal > totalContributed
@@ -114,6 +141,74 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
     if (sameAddress(connectedAddress, penaltySinkAddress)) return "Penalty sink";
     return "External wallet";
   })();
+
+  // ---------- Fund this campaign: eligibility ----------
+
+  // Reuses the same role classification shown above: only an "External wallet" (not the
+  // creator, verifier, or penalty sink) may contribute, mirroring the contract's own checks.
+  const isEligibleWallet = connectedRoleLabel === "External wallet";
+
+  const isFundingOpen = status === 0;
+  const hasRemainingToFund = remainingToFund !== undefined && remainingToFund > 0n;
+  const hasSufficientBalance =
+    usdcBalance !== undefined && remainingToFund !== undefined && usdcBalance >= remainingToFund;
+  const approvalComplete =
+    usdcAllowance !== undefined && remainingToFund !== undefined && usdcAllowance >= remainingToFund;
+
+  const canApprove =
+    !!connectedAddress &&
+    isFundingOpen &&
+    hasRemainingToFund &&
+    isEligibleWallet &&
+    hasSufficientBalance &&
+    !approvalComplete &&
+    !isApproving;
+
+  const canContribute =
+    !!connectedAddress &&
+    isFundingOpen &&
+    hasRemainingToFund &&
+    isEligibleWallet &&
+    hasSufficientBalance &&
+    approvalComplete &&
+    !isContributing;
+
+  const handleApproveFunding = async () => {
+    setFundingStatusMessage("");
+    if (!remainingToFund || remainingToFund <= 0n || !canApprove) return;
+
+    try {
+      const result = await writeUsdc({
+        functionName: "approve",
+        args: [CAMPAIGN_ADDRESS, remainingToFund],
+      });
+
+      if (result) {
+        await refetchUsdcAllowance();
+        setFundingStatusMessage(`Approval confirmed for ${formatUsdc(remainingToFund)} USDC.`);
+      }
+    } catch {
+      setFundingStatusMessage("USDC approval was not completed.");
+    }
+  };
+
+  const handleContribute = async () => {
+    setFundingStatusMessage("");
+    if (!remainingToFund || remainingToFund <= 0n || !canContribute) return;
+
+    try {
+      const result = await writeCampaign({
+        functionName: "contribute",
+        args: [CAMPAIGN_ID, remainingToFund],
+      });
+
+      if (result) {
+        setFundingStatusMessage("Contribution transaction confirmed.");
+      }
+    } catch {
+      setFundingStatusMessage("Contribution was not completed.");
+    }
+  };
 
   const bondLine = (() => {
     if (bondOutcome === undefined) return undefined;
@@ -240,6 +335,70 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
                   " — this wallet has contributed to this campaign."}
               </p>
             )}
+
+            {/* Fund this campaign */}
+            <div className="mt-6 rounded-box border border-base-300 p-4">
+              <p className="font-semibold">Fund this campaign</p>
+
+              {isFundingOpen ? (
+                <>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-box bg-base-200 px-4 py-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">
+                        Funding amount
+                      </p>
+                      <p className="mt-1 font-semibold">{formatUsdc(remainingToFund)} USDC</p>
+                    </div>
+                    <div className="rounded-box bg-base-200 px-4 py-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">
+                        Wallet balance
+                      </p>
+                      <p className="mt-1 font-semibold">{formatUsdc(usdcBalance)} USDC</p>
+                    </div>
+                    <div className="rounded-box bg-base-200 px-4 py-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">Allowance</p>
+                      <p className="mt-1 font-semibold">{formatUsdc(usdcAllowance)} USDC</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <button
+                      className="btn btn-outline"
+                      type="button"
+                      disabled={!canApprove}
+                      onClick={handleApproveFunding}
+                    >
+                      {isApproving
+                        ? "Approving…"
+                        : approvalComplete
+                          ? "Approved ✓"
+                          : `1. Approve ${formatUsdc(remainingToFund)} USDC`}
+                    </button>
+
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={!canContribute}
+                      onClick={handleContribute}
+                    >
+                      {isContributing ? "Contributing…" : `2. Contribute ${formatUsdc(remainingToFund)} USDC`}
+                    </button>
+                  </div>
+
+                  {fundingStatusMessage && (
+                    <div className="alert mt-3">
+                      <span className="text-sm">{fundingStatusMessage}</span>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="mt-2 text-sm text-base-content/60">
+                  {status === 1
+                    ? "Funding goal reached. Campaign is now Active."
+                    : "This campaign is no longer accepting contributions."}
+                </p>
+              )}
+            </div>
 
             {/* E. Deadlines */}
             <div className="mt-6 grid gap-5 md:grid-cols-2">
