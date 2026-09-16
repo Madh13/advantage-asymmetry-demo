@@ -43,7 +43,7 @@ const Home: NextPage = () => {
           <div className="mb-12 max-w-3xl">
             <div className="mb-4 flex flex-wrap gap-2">
               <span className="badge badge-success badge-outline">Sepolia</span>
-              <span className="badge badge-info badge-outline">USDC</span>
+              <span className="badge badge-info badge-outline">AUDD</span>
               <span className="badge badge-neutral badge-outline">Research prototype</span>
             </div>
 
@@ -120,7 +120,7 @@ const Home: NextPage = () => {
 
                   <div className="stat">
                     <div className="stat-title">Asset</div>
-                    <div className="stat-value text-2xl">USDC</div>
+                    <div className="stat-value text-2xl">AUDD</div>
                     <div className="stat-desc">6 decimals</div>
                   </div>
                 </div>
@@ -166,7 +166,7 @@ const Home: NextPage = () => {
                       <p className="font-semibold">Fund</p>
                     </div>
                     <p className="pl-10 text-sm text-base-content/65">
-                      Supporters contribute USDC into smart-contract-controlled escrow.
+                      Supporters contribute AUDD into smart-contract-controlled escrow.
                     </p>
                   </div>
 

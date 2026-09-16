@@ -6,16 +6,16 @@ import { useAccount } from "wagmi";
 import externalContracts from "~~/contracts/externalContracts";
 import { useScaffoldReadContract, useScaffoldWriteContract } from "~~/hooks/scaffold-eth";
 
-const USDC_DECIMALS = 6;
+const AUDD_DECIMALS = 6;
 
 type MilestoneInput = {
   description: string;
   amount: string;
 };
 
-const parseUsdc = (value: string) => {
+const parseAudd = (value: string) => {
   try {
-    return parseUnits(value || "0", USDC_DECIMALS);
+    return parseUnits(value || "0", AUDD_DECIMALS);
   } catch {
     return 0n;
   }
@@ -45,34 +45,34 @@ export const CreateCampaign = () => {
     functionName: "penaltySink",
   });
 
-  const { data: usdcBalance } = useScaffoldReadContract({
-    contractName: "USDC",
+  const { data: auddBalance } = useScaffoldReadContract({
+    contractName: "AUDD",
     functionName: "balanceOf",
     args: [connectedAddress],
   });
 
-  const { data: usdcAllowance, refetch: refetchUsdcAllowance } = useScaffoldReadContract({
-    contractName: "USDC",
+  const { data: auddAllowance, refetch: refetchAuddAllowance } = useScaffoldReadContract({
+    contractName: "AUDD",
     functionName: "allowance",
     args: [connectedAddress, campaignAddress],
   });
 
-  const { writeContractAsync: writeUsdc, isMining: isApproving } = useScaffoldWriteContract({
-    contractName: "USDC",
+  const { writeContractAsync: writeAudd, isMining: isApproving } = useScaffoldWriteContract({
+    contractName: "AUDD",
   });
 
   const { writeContractAsync: writeCampaign, isMining: isCreating } = useScaffoldWriteContract({
     contractName: "AdvantageAsymmetryCampaign",
   });
 
-  const goalBaseUnits = useMemo(() => parseUsdc(goal), [goal]);
-  const bondBaseUnits = useMemo(() => parseUsdc(bondAmount), [bondAmount]);
+  const goalBaseUnits = useMemo(() => parseAudd(goal), [goal]);
+  const bondBaseUnits = useMemo(() => parseAudd(bondAmount), [bondAmount]);
 
-  const milestoneAmounts = useMemo(() => milestones.map(milestone => parseUsdc(milestone.amount)), [milestones]);
+  const milestoneAmounts = useMemo(() => milestones.map(milestone => parseAudd(milestone.amount)), [milestones]);
 
   const milestoneTotal = useMemo(() => milestoneAmounts.reduce((sum, amount) => sum + amount, 0n), [milestoneAmounts]);
 
-  const milestoneTotalFormatted = formatUnits(milestoneTotal, USDC_DECIMALS);
+  const milestoneTotalFormatted = formatUnits(milestoneTotal, AUDD_DECIMALS);
 
   const fundingTimestamp = fundingDeadline ? BigInt(Math.floor(new Date(fundingDeadline).getTime() / 1000)) : 0n;
 
@@ -83,13 +83,13 @@ export const CreateCampaign = () => {
     ((verifier && connectedAddress.toLowerCase() === verifier.toLowerCase()) ||
       (penaltySink && connectedAddress.toLowerCase() === penaltySink.toLowerCase()));
 
-  const approvalComplete = bondBaseUnits > 0n && usdcAllowance !== undefined && usdcAllowance >= bondBaseUnits;
+  const approvalComplete = bondBaseUnits > 0n && auddAllowance !== undefined && auddAllowance >= bondBaseUnits;
 
-  const hasEnoughUsdc = usdcBalance !== undefined && usdcBalance >= bondBaseUnits;
+  const hasEnoughAudd = auddBalance !== undefined && auddBalance >= bondBaseUnits;
 
-  const usdcBalanceFormatted = usdcBalance !== undefined ? formatUnits(usdcBalance, USDC_DECIMALS) : "—";
+  const auddBalanceFormatted = auddBalance !== undefined ? formatUnits(auddBalance, AUDD_DECIMALS) : "—";
 
-  const usdcAllowanceFormatted = usdcAllowance !== undefined ? formatUnits(usdcAllowance, USDC_DECIMALS) : "—";
+  const auddAllowanceFormatted = auddAllowance !== undefined ? formatUnits(auddAllowance, AUDD_DECIMALS) : "—";
 
   useEffect(() => {
     setNowTimestamp(BigInt(Math.floor(Date.now() / 1000)));
@@ -123,15 +123,15 @@ export const CreateCampaign = () => {
     }
 
     if (goalBaseUnits <= 0n) {
-      errors.push("Goal must be greater than 0 USDC.");
+      errors.push("Goal must be greater than 0 AUDD.");
     }
 
     if (bondBaseUnits <= 0n) {
-      errors.push("Creator bond must be greater than 0 USDC.");
+      errors.push("Creator bond must be greater than 0 AUDD.");
     }
 
-    if (connectedAddress && usdcBalance !== undefined && bondBaseUnits > usdcBalance) {
-      errors.push("Wallet USDC balance is below the required creator bond.");
+    if (connectedAddress && auddBalance !== undefined && bondBaseUnits > auddBalance) {
+      errors.push("Wallet AUDD balance is below the required creator bond.");
     }
 
     if (milestones.length === 0) {
@@ -139,7 +139,7 @@ export const CreateCampaign = () => {
     }
 
     if (milestoneAmounts.some(amount => amount <= 0n)) {
-      errors.push("Every milestone amount must be greater than 0 USDC.");
+      errors.push("Every milestone amount must be greater than 0 AUDD.");
     }
 
     if (milestoneTotal !== goalBaseUnits) {
@@ -156,7 +156,7 @@ export const CreateCampaign = () => {
 
     return errors;
   }, [
-    usdcBalance,
+    auddBalance,
     bondBaseUnits,
     connectedAddress,
     creatorIsBlocked,
@@ -183,19 +183,19 @@ export const CreateCampaign = () => {
     }
 
     if (bondBaseUnits <= 0n) {
-      setStatusMessage("Enter a creator bond greater than 0 USDC.");
+      setStatusMessage("Enter a creator bond greater than 0 AUDD.");
       return;
     }
 
     try {
-      const result = await writeUsdc({
+      const result = await writeAudd({
         functionName: "approve",
         args: [campaignAddress, bondBaseUnits],
       });
 
       if (result) {
-        await refetchUsdcAllowance();
-        setStatusMessage(`Bond approval confirmed for ${bondAmount} USDC.`);
+        await refetchAuddAllowance();
+        setStatusMessage(`Bond approval confirmed for ${bondAmount} AUDD.`);
       }
     } catch {
       setStatusMessage("Bond approval was not completed.");
@@ -259,7 +259,7 @@ export const CreateCampaign = () => {
                 onChange={event => setGoal(event.target.value)}
               />
               <span className="join-item flex items-center border border-base-300 bg-base-200 px-4 text-sm font-semibold">
-                USDC
+                AUDD
               </span>
             </div>
           </label>
@@ -275,7 +275,7 @@ export const CreateCampaign = () => {
                 onChange={event => setBondAmount(event.target.value)}
               />
               <span className="join-item flex items-center border border-base-300 bg-base-200 px-4 text-sm font-semibold">
-                USDC
+                AUDD
               </span>
             </div>
           </label>
@@ -343,7 +343,7 @@ export const CreateCampaign = () => {
                       onChange={event => updateMilestone(index, "amount", event.target.value)}
                     />
                     <span className="join-item flex items-center border border-base-300 bg-base-100 px-3 text-xs font-semibold">
-                      USDC
+                      AUDD
                     </span>
                   </div>
                 </div>
@@ -359,7 +359,7 @@ export const CreateCampaign = () => {
                 milestoneTotal === goalBaseUnits && goalBaseUnits > 0n ? "text-success" : "text-base-content"
               }`}
             >
-              {milestoneTotalFormatted} / {goal || "0"} USDC
+              {milestoneTotalFormatted} / {goal || "0"} AUDD
             </span>
           </div>
         </div>
@@ -370,12 +370,12 @@ export const CreateCampaign = () => {
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             <div className="rounded-box bg-base-200 px-4 py-3">
               <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">Wallet balance</p>
-              <p className="mt-1 font-semibold">{usdcBalanceFormatted} USDC</p>
+              <p className="mt-1 font-semibold">{auddBalanceFormatted} AUDD</p>
             </div>
 
             <div className="rounded-box bg-base-200 px-4 py-3">
               <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">Bond allowance</p>
-              <p className="mt-1 font-semibold">{usdcAllowanceFormatted} USDC</p>
+              <p className="mt-1 font-semibold">{auddAllowanceFormatted} AUDD</p>
             </div>
           </div>
 
@@ -388,7 +388,7 @@ export const CreateCampaign = () => {
                 !connectedAddress ||
                 creatorIsBlocked ||
                 bondBaseUnits <= 0n ||
-                (usdcBalance !== undefined && !hasEnoughUsdc) ||
+                (auddBalance !== undefined && !hasEnoughAudd) ||
                 approvalComplete
               }
               onClick={handleApproveBond}

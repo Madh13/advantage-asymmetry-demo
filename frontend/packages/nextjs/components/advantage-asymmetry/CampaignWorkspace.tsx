@@ -9,7 +9,7 @@ import externalContracts from "~~/contracts/externalContracts";
 import { useScaffoldReadContract, useScaffoldWriteContract, useTargetNetwork } from "~~/hooks/scaffold-eth";
 
 const CAMPAIGN_ID = 0n;
-const USDC_DECIMALS = 6;
+const AUDD_DECIMALS = 6;
 const CAMPAIGN_ADDRESS = externalContracts[11155111].AdvantageAsymmetryCampaign.address;
 
 const CAMPAIGN_STATUS_LABELS = ["Funding", "Active", "Succeeded", "Failed"] as const;
@@ -29,7 +29,7 @@ const MILESTONE_STATUS_BADGE: Record<number, string> = {
   3: "badge-success",
 };
 
-const formatUsdc = (value: bigint | undefined) => (value === undefined ? "—" : formatUnits(value, USDC_DECIMALS));
+const formatAudd = (value: bigint | undefined) => (value === undefined ? "—" : formatUnits(value, AUDD_DECIMALS));
 
 const formatDeadline = (value: bigint | undefined) =>
   value === undefined || value === 0n ? "—" : new Date(Number(value) * 1000).toLocaleString();
@@ -99,20 +99,20 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
 
   // ---------- Fund this campaign: reads ----------
 
-  const { data: usdcBalance } = useScaffoldReadContract({
-    contractName: "USDC",
+  const { data: auddBalance } = useScaffoldReadContract({
+    contractName: "AUDD",
     functionName: "balanceOf",
     args: [connectedAddress],
   });
 
-  const { data: usdcAllowance, refetch: refetchUsdcAllowance } = useScaffoldReadContract({
-    contractName: "USDC",
+  const { data: auddAllowance, refetch: refetchAuddAllowance } = useScaffoldReadContract({
+    contractName: "AUDD",
     functionName: "allowance",
     args: [connectedAddress, CAMPAIGN_ADDRESS],
   });
 
-  const { writeContractAsync: writeUsdc, isMining: isApproving } = useScaffoldWriteContract({
-    contractName: "USDC",
+  const { writeContractAsync: writeAudd, isMining: isApproving } = useScaffoldWriteContract({
+    contractName: "AUDD",
   });
 
   const { writeContractAsync: writeCampaign, isMining: isContributing } = useScaffoldWriteContract({
@@ -151,9 +151,9 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
   const isFundingOpen = status === 0;
   const hasRemainingToFund = remainingToFund !== undefined && remainingToFund > 0n;
   const hasSufficientBalance =
-    usdcBalance !== undefined && remainingToFund !== undefined && usdcBalance >= remainingToFund;
+    auddBalance !== undefined && remainingToFund !== undefined && auddBalance >= remainingToFund;
   const approvalComplete =
-    usdcAllowance !== undefined && remainingToFund !== undefined && usdcAllowance >= remainingToFund;
+    auddAllowance !== undefined && remainingToFund !== undefined && auddAllowance >= remainingToFund;
 
   const canApprove =
     !!connectedAddress &&
@@ -178,17 +178,17 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
     if (!remainingToFund || remainingToFund <= 0n || !canApprove) return;
 
     try {
-      const result = await writeUsdc({
+      const result = await writeAudd({
         functionName: "approve",
         args: [CAMPAIGN_ADDRESS, remainingToFund],
       });
 
       if (result) {
-        await refetchUsdcAllowance();
-        setFundingStatusMessage(`Approval confirmed for ${formatUsdc(remainingToFund)} USDC.`);
+        await refetchAuddAllowance();
+        setFundingStatusMessage(`Approval confirmed for ${formatAudd(remainingToFund)} AUDD.`);
       }
     } catch {
-      setFundingStatusMessage("USDC approval was not completed.");
+      setFundingStatusMessage("AUDD approval was not completed.");
     }
   };
 
@@ -273,28 +273,28 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
             <div className="stats stats-vertical border border-base-300 bg-base-200 md:stats-horizontal">
               <div className="stat">
                 <div className="stat-title">Goal</div>
-                <div className="stat-value text-2xl">{formatUsdc(goal)}</div>
-                <div className="stat-desc">USDC</div>
+                <div className="stat-value text-2xl">{formatAudd(goal)}</div>
+                <div className="stat-desc">AUDD</div>
               </div>
               <div className="stat">
                 <div className="stat-title">Total contributed</div>
-                <div className="stat-value text-2xl">{formatUsdc(totalContributed)}</div>
-                <div className="stat-desc">USDC</div>
+                <div className="stat-value text-2xl">{formatAudd(totalContributed)}</div>
+                <div className="stat-desc">AUDD</div>
               </div>
               <div className="stat">
                 <div className="stat-title">Remaining to fund</div>
-                <div className="stat-value text-2xl">{formatUsdc(remainingToFund)}</div>
-                <div className="stat-desc">USDC</div>
+                <div className="stat-value text-2xl">{formatAudd(remainingToFund)}</div>
+                <div className="stat-desc">AUDD</div>
               </div>
               <div className="stat">
                 <div className="stat-title">Creator bond</div>
-                <div className="stat-value text-2xl">{formatUsdc(bondAmount)}</div>
-                <div className="stat-desc">USDC</div>
+                <div className="stat-value text-2xl">{formatAudd(bondAmount)}</div>
+                <div className="stat-desc">AUDD</div>
               </div>
               <div className="stat">
                 <div className="stat-title">Total released</div>
-                <div className="stat-value text-2xl">{formatUsdc(totalReleased)}</div>
-                <div className="stat-desc">USDC</div>
+                <div className="stat-value text-2xl">{formatAudd(totalReleased)}</div>
+                <div className="stat-desc">AUDD</div>
               </div>
             </div>
 
@@ -329,7 +329,7 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
 
             {connectedAddress && (
               <p className="mt-3 text-sm text-base-content/60">
-                Connected wallet contribution: {formatUsdc(connectedContribution)} USDC
+                Connected wallet contribution: {formatAudd(connectedContribution)} AUDD
                 {connectedContribution !== undefined &&
                   connectedContribution > 0n &&
                   " — this wallet has contributed to this campaign."}
@@ -347,17 +347,17 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
                       <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">
                         Funding amount
                       </p>
-                      <p className="mt-1 font-semibold">{formatUsdc(remainingToFund)} USDC</p>
+                      <p className="mt-1 font-semibold">{formatAudd(remainingToFund)} AUDD</p>
                     </div>
                     <div className="rounded-box bg-base-200 px-4 py-3">
                       <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">
                         Wallet balance
                       </p>
-                      <p className="mt-1 font-semibold">{formatUsdc(usdcBalance)} USDC</p>
+                      <p className="mt-1 font-semibold">{formatAudd(auddBalance)} AUDD</p>
                     </div>
                     <div className="rounded-box bg-base-200 px-4 py-3">
                       <p className="text-xs font-semibold uppercase tracking-wide text-base-content/45">Allowance</p>
-                      <p className="mt-1 font-semibold">{formatUsdc(usdcAllowance)} USDC</p>
+                      <p className="mt-1 font-semibold">{formatAudd(auddAllowance)} AUDD</p>
                     </div>
                   </div>
 
@@ -372,7 +372,7 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
                         ? "Approving…"
                         : approvalComplete
                           ? "Approved ✓"
-                          : `1. Approve ${formatUsdc(remainingToFund)} USDC`}
+                          : `1. Approve ${formatAudd(remainingToFund)} AUDD`}
                     </button>
 
                     <button
@@ -381,7 +381,7 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
                       disabled={!canContribute}
                       onClick={handleContribute}
                     >
-                      {isContributing ? "Contributing…" : `2. Contribute ${formatUsdc(remainingToFund)} USDC`}
+                      {isContributing ? "Contributing…" : `2. Contribute ${formatAudd(remainingToFund)} AUDD`}
                     </button>
                   </div>
 
@@ -437,7 +437,7 @@ export const CampaignWorkspace = ({ verifierAddress, penaltySinkAddress }: Campa
                           <p className="font-semibold">
                             Milestone {index + 1}: {data.description}
                           </p>
-                          <p className="text-sm text-base-content/60">{formatUsdc(data.amount)} USDC</p>
+                          <p className="text-sm text-base-content/60">{formatAudd(data.amount)} AUDD</p>
                         </div>
                         <span className={`badge ${MILESTONE_STATUS_BADGE[data.status] ?? "badge-neutral"}`}>
                           {MILESTONE_STATUS_LABELS[data.status] ?? "Unknown"}
